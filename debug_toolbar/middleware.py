@@ -33,7 +33,8 @@ class DebugToolbarMiddleware(object):
     """
     def __init__(self):
         self.debug_toolbars = {}
-        self.override_url = True
+        self.prev_original_urlconf = None
+        self.orig_patterns_len = None
 
         # Set method to use to decide to show toolbar
         self.show_toolbar = self._show_toolbar # default
@@ -66,12 +67,16 @@ class DebugToolbarMiddleware(object):
 
     def process_request(self, request):
         if self.show_toolbar(request):
-            if self.override_url:
-                original_urlconf = getattr(request, 'urlconf', settings.ROOT_URLCONF)
+            original_urlconf = getattr(request, 'urlconf', settings.ROOT_URLCONF)
+            if original_urlconf != self.prev_original_urlconf:
+                if self.orig_patterns_len is None:
+                    self.orig_patterns_len = len(debug_toolbar.urls.urlpatterns)
+
+                debug_toolbar.urls.urlpatterns = debug_toolbar.urls.urlpatterns[:self.orig_patterns_len]
                 debug_toolbar.urls.urlpatterns += patterns('',
                     ('', include(original_urlconf)),
                 )
-                self.override_url = False
+                self.prev_original_urlconf = original_urlconf
             request.urlconf = 'debug_toolbar.urls'
 
             self.debug_toolbars[request] = DebugToolbar(request)
