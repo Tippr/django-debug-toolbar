@@ -1,20 +1,29 @@
 from datetime import datetime
+import itertools
 import os
+import re
 import sys
 import SocketServer
 import traceback
 
 import django
 from django.conf import settings
-from django.db import connection
+try:
+    from django.db import connections
+except ImportError:
+    # Compat with < Django 1.2
+    from django.db import connection
+    connections = {'default': connection}
 from django.db.backends import util
 from django.views.debug import linebreak_iter
 from django.template import Node
+from django.template.defaultfilters import escape
 from django.template.loader import render_to_string
 from django.utils import simplejson
 from django.utils.encoding import force_unicode
 from django.utils.hashcompat import sha_constructor
-from django.utils.translation import ugettext_lazy as _
+from django.utils.safestring import mark_safe
+from django.utils.translation import ugettext_lazy as _, ungettext_lazy as __
 
 from debug_toolbar.panels import DebugPanel
 from debug_toolbar.utils import sqlparse
@@ -116,6 +125,7 @@ class DatabaseStatTracker(util.CursorDebugWrapper):
             # We keep `sql` to maintain backwards compatibility
             self.db.queries.append({
                 'sql': self.db.ops.last_executed_query(self.cursor, sql, params),
+                'time': duration * 1000,
                 'duration': duration,
                 'raw_sql': sql,
                 'params': _params,
@@ -139,16 +149,29 @@ class SQLDebugPanel(DebugPanel):
 
     def __init__(self, *args, **kwargs):
         super(self.__class__, self).__init__(*args, **kwargs)
-        self._offset = len(connection.queries)
+        self._offset = dict((k, len(connections[k].queries)) for k in connections)
         self._sql_time = 0
         self._queries = []
+        self._databases = {}
 
     def nav_title(self):
         return _('SQL')
 
     def nav_subtitle(self):
-        self._queries = connection.queries[self._offset:]
-        self._sql_time = sum([q['duration'] for q in self._queries])
+        self._queries = []
+        self._databases = {}
+        for alias in connections:
+            db_queries = connections[alias].queries[self._offset[alias]:]
+            num_queries = len(db_queries)
+            if num_queries:
+                self._databases[alias] = {
+                    'time_spent': sum(q['duration'] for q in db_queries),
+                    'queries': num_queries,
+                }
+                self._queries.extend([(alias, q) for q in db_queries])
+
+        self._queries.sort(key=lambda x: x[1]['start_time'])
+        self._sql_time = sum([d['time_spent'] for d in self._databases.itervalues()])
         num_queries = len(self._queries)
         # TODO l10n: use ngettext
         return "%d %s in %.2fms" % (
@@ -158,25 +181,61 @@ class SQLDebugPanel(DebugPanel):
         )
 
     def title(self):
-        return _('SQL Queries')
+        count = len(self._databases)
+        
+        return __('SQL Queries from %(count)d connection', 'SQL Queries from %(count)d connections', count) % dict(
+            count=count,
+        )
 
     def url(self):
         return ''
 
     def content(self):
         width_ratio_tally = 0
-        for query in self._queries:
+        colors = [
+            (256, 0, 0), # red
+            (0, 256, 0), # blue
+            (0, 0, 256), # green
+        ]
+        factor = int(256.0/(len(self._databases)*2.5))
+        for n, db in enumerate(self._databases.itervalues()):
+            rgb = [0, 0, 0]
+            color = n % 3
+            rgb[color] = 256 - n/3*factor
+            nn = color
+            # XXX: pretty sure this is horrible after so many aliases
+            while rgb[color] < factor:
+                print rgb[color], factor
+                nc = min(256 - rgb[color], 256)
+                rgb[color] += nc
+                nn += 1
+                if nn > 2:
+                    nn = 0
+                rgb[nn] = nc
+            db['rgb_color'] = rgb
+        
+        for alias, query in self._queries:
+            query['alias'] = alias
             query['sql'] = reformat_sql(query['sql'])
+            query['rgb_color'] = self._databases[alias]['rgb_color']
             try:
                 query['width_ratio'] = (query['duration'] / self._sql_time) * 100
             except ZeroDivisionError:
                 query['width_ratio'] = 0
             query['start_offset'] = width_ratio_tally
+            query['end_offset'] = query['width_ratio'] + query['start_offset']
             width_ratio_tally += query['width_ratio']
-
+            
+            stacktrace = []
+            for frame in query['stacktrace']:
+                params = map(escape, frame[0].rsplit('/', 1) + list(frame[1:]))
+                stacktrace.append('<span class="path">{0}/</span><span class="file">{1}</span> in <span class="func">{3}</span>(<span class="lineno">{2}</span>)\n  <span class="code">{4}</span>"'.format(*params))
+            query['stacktrace'] = mark_safe('\n'.join(stacktrace))
+        
         context = self.context.copy()
         context.update({
-            'queries': self._queries,
+            'databases': sorted(self._databases.items(), key=lambda x: -x[1]['time_spent']),
+            'queries': [q for a, q in self._queries],
             'sql_time': self._sql_time,
             'is_mysql': settings.DATABASE_ENGINE == 'mysql',
         })
@@ -201,8 +260,11 @@ class BoldKeywordFilter(sqlparse.filters.Filter):
             if is_keyword:
                 yield sqlparse.tokens.Text, '</strong>'
 
+def swap_fields(sql):
+    return re.sub('SELECT</strong> (.*) <strong>FROM', 'SELECT</strong> <span class="djDebugCollapse">\g<1></span> <strong>FROM', sql)
+
 def reformat_sql(sql):
     stack = sqlparse.engine.FilterStack()
     stack.preprocess.append(BoldKeywordFilter()) # add our custom filter
     stack.postprocess.append(sqlparse.filters.SerializerUnicode()) # tokens -> strings
-    return ''.join(stack.run(sql))
+    return swap_fields(''.join(stack.run(sql)))
